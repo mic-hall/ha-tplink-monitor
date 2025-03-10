@@ -1,0 +1,5 @@
+
+*.bak
+venv/
+debugtest.py
+__pycache__

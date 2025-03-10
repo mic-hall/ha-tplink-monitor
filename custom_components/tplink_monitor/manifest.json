@@ -1,0 +1,10 @@
+{
+  "domain": "tplink_monitor",
+  "name": "TP-Link Switch Bandwidth Monitor",
+  "documentation": "https://github.com/bairnhard/homeassistant-tplink-monitor",
+  "dependencies": [],
+  "requirements": ["requests", "beautifulsoup4"],
+  "codeowners": ["@bairnhard"],
+  "version": "1.0",
+  "config_flow": true
+}
