@@ -1,5 +1,8 @@
 import logging
+import asyncio
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -7,7 +10,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 from datetime import timedelta
 from .const import DOMAIN, CONF_IP, CONF_USERNAME, CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_MTU
-from .tplink_monitor import fetch_port_statistics
+from .tplink_monitor import fetch_port_statistics, fetch_system_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,12 +21,40 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities):
     ip = config[CONF_IP]
     username = config[CONF_USERNAME]
     password = config[CONF_PASSWORD]
-    scan_interval = config.get(CONF_SCAN_INTERVAL, 15)  # Default to 15s
+    scan_interval = config.get(CONF_SCAN_INTERVAL, 60)  # Default to 60s
     mtu = config.get(CONF_MTU, 1500)  # Default MTU
 
     coordinator = TPLinkCoordinator(hass, ip, username, password, scan_interval, mtu)
 
-    sensors = [TplinkPortSensor(coordinator, port) for port in range(1, 17)]
+    _LOGGER.debug("Fetching system info for device registration...")
+    system_info = await hass.async_add_executor_job(fetch_system_info, ip, username, password)
+
+    if not system_info or "mac_address" not in system_info:
+        _LOGGER.error("⚠️ Failed to retrieve system info. Device will NOT be registered.")
+        return
+
+    _LOGGER.info(f"✅ System Info Retrieved: {system_info}")
+
+    # Register the device in Home Assistant's device registry
+    device_registry = dr.async_get(hass)
+    device_entry = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, system_info["mac_address"])},
+        manufacturer="TP-Link",
+        name=f"TP-Link Switch ({system_info['device_model']})",
+        model=system_info["device_model"],
+        sw_version=system_info["firmware_version"],
+        hw_version=system_info["hardware_version"],
+        configuration_url=f"http://{system_info['ip_address']}",
+    )
+
+    _LOGGER.info(f"✅ Device registered: {device_entry.name}")
+
+    # Wait for first coordinator update
+    await coordinator.async_config_entry_first_refresh()
+
+    # Add sensors (ports)
+    sensors = [TplinkPortSensor(coordinator, port, system_info["mac_address"]) for port in range(1, 17)]
     async_add_entities(sensors, True)
 
 
@@ -43,21 +74,44 @@ class TPLinkCoordinator(DataUpdateCoordinator):
         self.username = username
         self.password = password
         self.mtu = mtu
+        self.system_info = None
 
     async def _async_update_data(self):
         """Fetch latest switch statistics asynchronously using `requests`."""
-        return await self.hass.async_add_executor_job(
-            fetch_port_statistics, self.ip, self.username, self.password
-        )
+        try:
+            port_stats = await self.hass.async_add_executor_job(
+                fetch_port_statistics, self.ip, self.username, self.password
+            )
+        except Exception as e:
+            _LOGGER.error(f"Error fetching port statistics: {e}")
+            return None
+
+        # Fetch system info only once
+        if not self.system_info:
+            try:
+                _LOGGER.debug("Attempting to fetch system info...")
+                self.system_info = await self.hass.async_add_executor_job(
+                    fetch_system_info, self.ip, self.username, self.password
+                )
+                if not self.system_info:
+                    _LOGGER.error("System info returned empty!")
+                else:
+                    _LOGGER.info(f"System Info Retrieved: {self.system_info}")
+            except Exception as e:
+                _LOGGER.error(f"Error fetching system info: {e}")
+                self.system_info = None  # Explicitly set to None on failure
+
+        return port_stats
 
 
 class TplinkPortSensor(CoordinatorEntity, Entity):
     """Representation of a TP-Link Switch Port Sensor."""
 
-    def __init__(self, coordinator, port):
+    def __init__(self, coordinator, port, device_mac):
         """Initialize the sensor."""
         super().__init__(coordinator)
         self._port = port
+        self._device_mac = device_mac  # Link this port to the device MAC
         self._attr_name = f"Port {port} Bandwidth"
         self._prev_rx_good = None
         self._prev_tx_good = None
@@ -67,37 +121,50 @@ class TplinkPortSensor(CoordinatorEntity, Entity):
         self._attr_device_class = "data_rate"
         self._attr_state_class = "measurement"
 
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return device information for the TP-Link switch."""
+        system_info = self.coordinator.system_info
+
+        if not system_info:
+            _LOGGER.warning("⚠️ System Info is missing, device will not be registered.")
+            return None
+
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._device_mac)},  # Use device MAC for linking
+            name="TP-Link Smart Switch",
+            manufacturer="TP-Link",
+            model=system_info["device_model"],
+            sw_version=system_info["firmware_version"],
+            hw_version=system_info["hardware_version"],
+            connections={(("mac", self._device_mac))},
+            configuration_url=f"http://{system_info['ip_address']}",
+        )
 
     @property
     def state(self):
         """Return the calculated bandwidth in Mbps."""
         data = self.coordinator.data
-        if not data or self._port not in data:            
+        if not data or self._port not in data:
             return 0
 
         # Get current packet count
         rx_good = data[self._port]["rx_good"]
         tx_good = data[self._port]["tx_good"]
 
-        # Get the polling interval directly
+        # Use the polling interval for time_diff
         time_diff = self.coordinator.update_interval.total_seconds()
 
-        # Check if this is the first run (no previous data)
         if self._prev_rx_good is None or self._prev_tx_good is None:
             self._prev_rx_good = rx_good
-            self._prev_tx_good = tx_good            
+            self._prev_tx_good = tx_good
             return 0  # No bandwidth calculation yet
 
-        # Calculate packet difference
-        rx_diff = rx_good - self._prev_rx_good
-        tx_diff = tx_good - self._prev_tx_good
-
-        # Convert packets to Mbps using MTU and known scan interval
+        # Calculate bandwidth
         mtu = self.coordinator.mtu
-        self._rx_mbps = (rx_diff * mtu * 8) / (time_diff * 1e6)
-        self._tx_mbps = (tx_diff * mtu * 8) / (time_diff * 1e6)
+        self._rx_mbps = (rx_good - self._prev_rx_good) * mtu * 8 / (time_diff * 1e6)
+        self._tx_mbps = (tx_good - self._prev_tx_good) * mtu * 8 / (time_diff * 1e6)
 
-        # Update stored values for next calculation
         self._prev_rx_good = rx_good
         self._prev_tx_good = tx_good
 
@@ -107,7 +174,7 @@ class TplinkPortSensor(CoordinatorEntity, Entity):
     def extra_state_attributes(self):
         """Return additional switch statistics."""
         data = self.coordinator.data
-        if not data or self._port not in data:            
+        if not data or self._port not in data:
             return {}
 
         return {
@@ -120,3 +187,4 @@ class TplinkPortSensor(CoordinatorEntity, Entity):
             "rx_mbps": round(self._rx_mbps, 2),
             "tx_mbps": round(self._tx_mbps, 2),
         }
+

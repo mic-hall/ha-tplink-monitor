@@ -2,6 +2,7 @@
   "domain": "tplink_monitor",
   "name": "TP-Link Switch Bandwidth Monitor",
   "documentation": "https://github.com/bairnhard/ha-tplink-monitor",
+  "issue_tracker": "https://github.com/bairnhard/ha-tplink-monitor/issues",
   "dependencies": [],
   "requirements": ["requests", "beautifulsoup4"],
   "codeowners": ["@bairnhard"],

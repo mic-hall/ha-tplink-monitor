@@ -73,3 +73,61 @@ def fetch_port_statistics(ip, username, password):
         }
     
     return port_stats
+
+def fetch_system_info(ip, username, password):
+    """Fetch system info from the TP-Link switch web interface."""
+    session = requests.Session()
+    data = {"logon": "Login", "username": username, "password": password}
+
+    try:
+        # Login to the switch
+        login_response = session.post(f"http://{ip}/logon.cgi", data=data)
+        if login_response.status_code != 200:
+            _LOGGER.error(f"Login failed during system info fetch: {login_response.status_code}")
+            return None
+        
+        # Get system info page
+        response = session.get(f"http://{ip}/SystemInfoRpm.htm")
+        
+        if response.status_code != 200:
+            _LOGGER.error(f"Failed to fetch system info (HTTP {response.status_code})")
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Extract JavaScript block containing system info
+        script_tag = soup.find("script")
+        if not script_tag or not script_tag.string:
+            _LOGGER.error("No script block found in SystemInfoRpm.htm")
+            return None
+
+        script_text = script_tag.string
+
+        # Debug: Log script text
+        _LOGGER.debug("System Info Script Block retrieved")
+
+        # Extract system info safely
+        def extract_value(pattern):
+            match = re.search(pattern, script_text, re.DOTALL)  # Use DOTALL to match across lines
+            return match.group(1).strip() if match else "Unknown"
+
+        info = {
+            "device_model": extract_value(r'descriStr:\[\s*"([^"]+)"\s*\]'),
+            "mac_address": extract_value(r'macStr:\[\s*"([^"]+)"\s*\]'),
+            "ip_address": extract_value(r'ipStr:\[\s*"([^"]+)"\s*\]'),
+            "subnet_mask": extract_value(r'netmaskStr:\[\s*"([^"]+)"\s*\]'),
+            "default_gateway": extract_value(r'gatewayStr:\[\s*"([^"]+)"\s*\]'),
+            "firmware_version": extract_value(r'firmwareStr:\[\s*"([^"]+)"\s*\]'),
+            "hardware_version": extract_value(r'hardwareStr:\[\s*"([^"]+)"\s*\]')
+        }
+
+        # Verify we extracted a valid MAC address 
+        if info["mac_address"] == "Unknown":
+            _LOGGER.error("Failed to extract MAC address from system info")
+            return None
+
+        return info
+    except Exception as e:
+        _LOGGER.error(f"Exception in fetch_system_info: {str(e)}")
+        return None
+
