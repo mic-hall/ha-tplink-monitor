@@ -54,7 +54,7 @@ def fetch_port_statistics(ip, username, password):
     link_values = list(map(int, link_match.group(1).split(",")))
 
     # Extract Number of Ports
-    max_port_num_match = re.search(r"var max_port_num = (\d+);", script_text)
+    max_port_num_match = 24
     if not max_port_num_match:
         _LOGGER.error("Could not find max_port_num!")
         return None
